@@ -1,5 +1,6 @@
 ((
-  { config } = pipy.solve('config.js'),
+  { config, socketTimeoutOptions } = pipy.solve('config.js'),
+  { metrics } = pipy.solve('lib/metrics.js'),
   listeners = {},
   listenPort = 0,
 ) => pipy()
@@ -8,11 +9,45 @@
   __port: null,
 })
 
+.branch(
+  config?.Configs?.PidFile, (
+    $=>$
+    .task()
+    .onStart(
+      () => void (
+        os.writeFile(config.Configs.PidFile, '' + pipy.pid)
+      )
+    )
+    .exit()
+    .onStart(
+      () => void (
+        os.unlink(config.Configs.PidFile)
+      )
+    )
+  )
+)
+.task()
+.onStart(
+  () => void (
+    metrics.fgwMetaInfo.withLabels(pipy.uuid || '', pipy.name || '', pipy.source || '', os.env.PIPY_K8S_CLUSTER || '').increase()
+  )
+)
+.branch(
+  (config?.Configs?.ResourceUsage?.ScrapeInterval > 0), (
+    $=>$
+    .task()
+    .use('common/resource-usage.js')
+  )
+)
+
 .repeat(
   (config.Listeners || []),
-  ($, l)=>$.listen(
-    (listenPort = (l.Listen || l.Port || 0), listeners[listenPort] = new ListenerArray, listeners[listenPort].add(listenPort), listeners[listenPort]),
-    { ...l, protocol: (l?.Protocol === 'UDP') ? 'udp' : 'tcp' }
+  ($, l) => $.listen(
+    (
+      listenPort = (l.Listen || l.Port || 0),
+      listeners[listenPort] = new ListenerArray([{ ...socketTimeoutOptions, ...l, port: listenPort, protocol: (l.Protocol?.toLowerCase?.() === 'udp') ? 'udp' : 'tcp' }]),
+      listeners[listenPort]
+    )
   )
   .onStart(
     () => (
@@ -39,6 +74,9 @@
   ),
   () => (__port?.Protocol === 'TCP'), (
     $=>$.chain(config?.Chains?.TCPRoute || [])
+  ),
+  () => (__port?.Protocol === 'UDP'), (
+    $=>$.chain(config?.Chains?.UDPRoute || [])
   ),
   (
     $=>$.replaceStreamStart(new StreamEnd)

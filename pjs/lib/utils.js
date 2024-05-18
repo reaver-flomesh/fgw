@@ -1,12 +1,8 @@
 ((
-  hexChar = { '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, 'a': 10, 'b': 11, 'c': 12, 'd': 13, 'e': 14, 'f': 15 },
   toInt63 = str => (
-    (
-      value = str.split('').reduce((calc, char) => (calc * 16) + hexChar[char], 0),
-    ) => value / 2
-  )(),
+    new Int("u64", new Data(str, "hex").toArray()).toString() / 2
+  ),
   traceId = () => algo.uuid().substring(0, 18).replaceAll('-', ''),
-
 ) => (
   {
     namespace: (os.env.POD_NAMESPACE || 'default'),
@@ -18,20 +14,21 @@
     traceId,
 
     initRateLimit: rateLimit => (
-      rateLimit?.Local ? (
+      rateLimit ? (
         {
+          mode: rateLimit.Mode, // default "Local"
           count: 0,
-          backlog: rateLimit.Local.Backlog || 0,
+          backlog: rateLimit.Backlog || 0,
           quota: new algo.Quota(
-            rateLimit.Local.Burst || rateLimit.Local.Requests || 0,
+            rateLimit.Burst || rateLimit.Requests || 0,
             {
-              produce: rateLimit.Local.Requests || 0,
-              per: rateLimit.Local.StatTimeWindow || 0,
+              produce: rateLimit.Requests || 0,
+              per: rateLimit.StatTimeWindow || 0,
             }
           ),
           response: new Message({
-            status: rateLimit.Local.ResponseStatusCode || 429,
-            headers: Object.fromEntries((rateLimit.Local.ResponseHeadersToAdd || []).map(({ Name, Value }) => [Name, Value])),
+            status: rateLimit.ResponseStatusCode || 429,
+            headers: rateLimit.ResponseHeadersToAdd || {},
           }),
         }
       ) : null
@@ -57,6 +54,25 @@
         Object.keys(obj).length === 0 ? null : new algo.RoundRobinLoadBalancer(obj)
       ))() : null
     ),
+
+    getNonNegativeNumber: num => (
+      (
+        n = +num,
+        str = ('' + num).toLowerCase(),
+      ) => (
+        str.endsWith('m') ? (
+          n = +str.substring(0, str.length - 1) * 1000000
+        ) : str.endsWith('k') && (
+          n = +str.substring(0, str.length - 1) * 1000
+        ),
+        (n >= 0) ? (
+          n
+        ) : (
+          console.log(`Bad non-negative number: ${num}, set it to a default value of 0.`),
+          0
+        )
+      )
+    )(),
 
   }
 ))()

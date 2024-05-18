@@ -1,9 +1,27 @@
 ((
   { config, isDebugEnabled } = pipy.solve('config.js'),
 
-  healthCheckTargets = {},
+  { healthCheckTargets, healthCheckServices } = pipy.solve('common/variables.js'),
 
-  healthCheckServices = {},
+  hcLogging = config?.Configs?.HealthCheckLog?.StorageAddress && new logging.JSONLogger('health-check-logger').toHTTP(config.Configs.HealthCheckLog.StorageAddress, {
+    batch: {
+      timeout: 1,
+      interval: 1,
+      prefix: '[',
+      postfix: ']',
+      separator: ','
+    },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': config.Configs.HealthCheckLog.Authorization || ''
+    }
+  }).log,
+
+  k8s_cluster = os.env.PIPY_K8S_CLUSTER || '',
+  code_base = pipy.source || '',
+  pipy_id = pipy.name || '',
+
+  { metrics } = pipy.solve('lib/metrics.js'),
 
   makeHealthCheck = (serviceConfig) => (
     serviceConfig?.HealthCheck && (
@@ -12,37 +30,58 @@
         interval = serviceConfig.HealthCheck?.Interval, // || 15, active
         maxFails = serviceConfig.HealthCheck?.MaxFails, // || 3, both
         failTimeout = serviceConfig.HealthCheck?.FailTimeout, // || 300, passivity
-        uri = serviceConfig.HealthCheck?.Uri, // for HTTP
-        matches = serviceConfig.HealthCheck?.Matches || [{ Type: "status", Value: "200" }], // for HTTP
-        type = uri ? 'HTTP' : 'TCP',
+        path = serviceConfig.HealthCheck?.Path, // for HTTP
+        matches = serviceConfig.HealthCheck?.Matches || [{ StatusCodes: [200] }], // for HTTP
+        type = path ? 'HTTP' : 'TCP',
       ) => (
         {
           name,
           interval,
           maxFails,
           failTimeout,
-          uri,
+          path,
           matches,
 
           toString: () => (
-            'service: ' + name + ', interval: ' + interval + ', maxFails: ' + maxFails + ', uri: ' + uri + ', matches: ' + matches
+            'service: ' + name + ', interval: ' + interval + ', maxFails: ' + maxFails + ', path: ' + path + ', matches: ' + matches
           ),
 
           ok: target => (
-            (target.alive === 0) && (
+            (target.alive === 0) ? (
               target.alive = 1,
               target.errorCount = 0,
               healthCheckServices[name] && healthCheckServices[name].get(target.target) && (
                 healthCheckServices[name].remove(target.target)
               ),
               isDebugEnabled && (
-                console.log('[health-check] ok - service, type, target:', name, type, target.target)
-              )
-            )
+                console.log('[health-check] ok - service, type, target:', name, type, target)
+              ),
+              _changed = 1
+            ) : (
+              _changed = 0
+            ),
+            metrics.fgwUpstreamStatus.withLabels(
+              name,
+              target.ip,
+              target.port,
+              target.reason = 'ok',
+              target.http_status || '',
+              _changed
+            ).increase(),
+            hcLogging?.({
+              k8s_cluster,
+              code_base,
+              pipy_id,
+              upstream_ip: target.ip,
+              upstream_port: target.port,
+              type: 'ok',
+              http_status: target.http_status || '',
+              change_status: _changed
+            })
           ),
 
           fail: target => (
-            (++target.errorCount >= maxFails && target.alive) && (
+            (++target.errorCount >= maxFails && target.alive) ? (
               target.alive = 0,
               target.failTick = 0,
               !healthCheckServices[name] ? (
@@ -54,55 +93,113 @@
                 )
               ),
               isDebugEnabled && (
-                console.log('[health-check] fail - service, type, target:', name, type, target.target)
-              )
-            )
+                console.log('[health-check] fail - service, type, target:', name, type, target)
+              ),
+              _changed = -1
+            ) : (
+              _changed = 0
+            ),
+            metrics.fgwUpstreamStatus.withLabels(
+              name,
+              target.ip,
+              target.port,
+              target.reason || 'fail',
+              target.http_status || '',
+              _changed
+            ).decrease(),
+            hcLogging?.({
+              k8s_cluster,
+              code_base,
+              pipy_id,
+              upstream_ip: target.ip,
+              upstream_port: target.port,
+              type: target.reason || 'fail',
+              http_status: target.http_status || '',
+              change_status: _changed
+            })
           ),
 
           available: target => (
             target.alive > 0
           ),
 
-          match: msg => (
+          match: (
             (
+              rules,
               match_rules = matches.map(
                 m => (
-                  (m?.Type === 'status') ? (
-                    msg => (
-                      msg?.head?.status == m?.Value
-                    )
-                  ) : (
-                    (m?.Type === 'body') ? (
+                  rules = [],
+                  m?.StatusCodes && (
+                    rules.push(
                       msg => (
-                        msg?.body?.toString?.()?.includes(m?.Value)
-                      )
-                    ) : (
-                      (m?.Type === 'headers') ? (
-                        msg => (
-                          msg?.head?.headers?.[m?.Name?.toLowerCase?.()] === m?.Value
-                        )
-                      ) : (
-                        () => false
+                        m.StatusCodes.includes(msg?.head?.status) || -1
                       )
                     )
+                  ),
+                  m?.Body && (
+                    rules.push(
+                      msg => (
+                        msg?.body?.toString?.()?.includes(m.Body) || -2
+                      )
+                    )
+                  ),
+                  m?.Headers && (
+                    rules.push(
+                      Object.entries(m.Headers).map(
+                        ([k, v]) => (
+                          msg => (
+                            (msg?.head?.headers?.[k.toLowerCase?.()] == v) || -3
+                          )
+                        )
+                      )
+                    )
+                  ),
+                  (rules.length === 0) ? (
+                    () => -100
+                  ) : (
+                    rules.flat()
                   )
                 )
-              ),
+              ).flat()
             ) => (
-              match_rules.every(m => m(msg))
+              msg => (
+                (
+                  err = 0
+                ) => (
+                  match_rules.every(
+                    m => (
+                      (err = m(msg)) > 0
+                    )
+                  ) || err
+                )
+              )()
             )
           )(),
 
           check: target => (
-            new http.Agent(target.target).request('GET', uri).then(
+            new http.Agent(target.target).request('GET', path).then(
               result => (
-                target.service.match(result) ? (
-                  target.service.ok(target)
-                ) : (
-                  target.service.fail(target)
-                ),
-                {}
-              )
+                (
+                  code = target.service.match(result)
+                ) => (
+                  target.http_status = result?.head?.status,
+                  (code > 0) ? (
+                    target.service.ok(target)
+                  ) : (
+                    (code == -1) ? (
+                      target.reason = "Bad-StatusCode"
+                    ) : (code == -2) ? (
+                      target.reason = "Bad-Body"
+                    ) : (code == -3) ? (
+                      target.reason = "Bad-Header"
+                    ) : (
+                      target.reason = "Bad-Matches"
+                    ),
+                    target.service.fail(target)
+                  ),
+                  {}
+                )
+              )()
             )
           ),
         }
@@ -111,18 +208,14 @@
   ),
 
   healthCheckCache = new algo.Cache(makeHealthCheck),
-
 ) => pipy({
+  _idx: 0,
+  _changed: 0,
   _service: null,
   _target: null,
   _resolve: null,
   _tcpTargets: null,
   _targetPromises: null,
-})
-
-.export('health-check', {
-  __healthCheckTargets: healthCheckTargets,
-  __healthCheckServices: healthCheckServices,
 })
 
 .pipeline()
@@ -137,7 +230,10 @@
           (_service = healthCheckCache.get(config.Services[name])) && (
             Object.keys(config.Services[name].Endpoints || {}).forEach(
               target => (
+                _idx = target.lastIndexOf(':'),
                 healthCheckTargets[target + '@' + name] = {
+                  ip: target.substring(0, _idx),
+                  port: target.substring(_idx + 1),
                   target,
                   service: _service,
                   alive: 1,
@@ -166,7 +262,7 @@
       target => (
         (target.service.interval > 0 && ++target.tick >= target.service.interval) && (
           target.tick = 0,
-          target.service.uri ? ( // for HTTP
+          target.service.path ? ( // for HTTP
             target.service.check(target)
           ) : ( // for TCP
             _targetPromises.push(new Promise(r => _resolve = r)),
@@ -204,6 +300,7 @@
           (!e.error || e.error === "ReadTimeout" || e.error === "IdleTimeout") ? (
             _target.service.ok(_target)
           ) : (
+            _target.reason = 'ConnectionRefused',
             _target.service.fail(_target)
           ),
           _resolve(),

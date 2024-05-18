@@ -1,6 +1,24 @@
 ((
   { config, isDebugEnabled } = pipy.solve('config.js'),
 
+  { getNonNegativeNumber } = pipy.solve('lib/utils.js'),
+
+  clientMaxBodySizeCache = new algo.Cache(
+    route => (
+      typeof (route?.config?.ClientMaxBodySize) !== 'undefined' ? (
+        getNonNegativeNumber(route.config.ClientMaxBodySize)
+      ) : (
+        typeof (__domain?.ClientMaxBodySize) !== 'undefined' ? (
+          getNonNegativeNumber(__domain.ClientMaxBodySize)
+        ) : (
+          typeof (config?.Configs?.ClientMaxBodySize) !== 'undefined' ? (
+            getNonNegativeNumber(config.Configs.ClientMaxBodySize)
+          ) : 1000000 // 1m
+        )
+      )
+    )
+  ),
+
   makeMatchDomainHandler = portRouteRules => (
     (
       domains = {},
@@ -136,7 +154,10 @@
             )
           )
         ),
-        backendServiceBalancer: new algo.RoundRobinLoadBalancer(rule?.BackendService || {}),
+        backendServiceBalancer: new algo.RoundRobinLoadBalancer(Object.fromEntries(Object.entries(rule?.BackendService || {})
+          .map(([k, v]) => [k, v.Weight])
+          .filter(([k, v]) => v > 0)
+        )),
         ...(rule?.ServerRoot && { serverRoot: rule.ServerRoot })
       }
     )
@@ -151,8 +172,8 @@
             (
               grpc = (path || '').split('/'),
             ) => (
-              (path === '/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo') || (
-                (rule?.Method?.Service === grpc[1]) && (rule?.Method?.Method === grpc[2])
+              path?.startsWith('/grpc.reflection.') || (
+                (!rule?.Method?.Service || rule?.Method?.Service === grpc[1]) && (!rule?.Method?.Method || rule?.Method?.Method === grpc[2])
               )
             )
           )()
@@ -166,7 +187,10 @@
             (!matchMethod || matchMethod(message?.head?.path))
           )
         ),
-        backendServiceBalancer: new algo.RoundRobinLoadBalancer(rule?.BackendService || {})
+        backendServiceBalancer: new algo.RoundRobinLoadBalancer(Object.fromEntries(Object.entries(rule?.BackendService || {})
+          .map(([k, v]) => [k, v.Weight])
+          .filter(([k, v]) => v > 0)
+        )),
       }
     )
   )(),
@@ -231,6 +255,9 @@
 
 ) => pipy({
   _host: undefined,
+  _continue: true,
+  _clientBodySize: 0,
+  _clientMaxBodySize: 0,
 })
 
 .export('route', {
@@ -252,6 +279,9 @@
     ),
     !__domain && config?.Configs?.StripAnyHostPort && (
       handleMessage(msg?.head?.headers?.host?.split(':')?.[0], msg)
+    ),
+    __route && (__domain.RouteType === 'HTTP') && (
+      _clientMaxBodySize = clientMaxBodySizeCache.get(__route)
     )
   )
 )
@@ -264,6 +294,35 @@
     )
   )
 )
-.chain()
+.branch(
+  () => (_clientMaxBodySize > 0), (
+    $=>$
+    .replaceData(
+      dat => (
+        _clientBodySize += dat.size,
+        _clientBodySize > _clientMaxBodySize ? (
+          _continue = false,
+          null
+        ) : dat
+      )
+    )
+    .replaceMessage(
+      msg => (
+        !_continue ? (
+          new Message({ status: 413 }, 'Request Entity Too Large')
+        ) : msg
+      )
+    )
+  ), (
+    $=>$
+  )
+)
+.branch(
+  () => _continue, (
+    $=>$.chain()
+  ), (
+    $=>$
+  )
+)
 
 )()

@@ -23,7 +23,9 @@
               "Path": "/"
             },
             "BackendService": {
-              "backendService1": 100
+              "backendService1": {
+                "Weight": 100
+              }
             }
           }
         ]
@@ -56,11 +58,12 @@
         "Interval": 10,
         "MaxFails": 3,
         "FailTimeout": 30,
-        "Uri": "/",
+        "Path": "/",
         "Matches": [
           {
-            "Type": "status",
-            "Value": "200"
+            "StatusCodes": [
+              200
+            ]
           }
         ]
       },

@@ -3,16 +3,16 @@
 
   uniqueCA = {},
   unionCA = (config?.Listeners || []).filter(
-    o => o?.TLS?.Certificates
+    o => o?.TLS?.CACerts
   ).map(
-    o => o.TLS.Certificates.map(
-      c => c.IssuingCA && (
+    o => o.TLS.CACerts.map(
+      c => c && (
         (
-          md5 = algo.hash(c.IssuingCA)
+          md5 = algo.hash(c)
         ) => (
           !uniqueCA[md5] && (
             uniqueCA[md5] = true,
-            new crypto.Certificate(c.IssuingCA)
+            new crypto.Certificate(c)
           )
         )
       )()
@@ -81,6 +81,18 @@
     )
   )(),
 
+  alpnPolicy = names => (
+    __port?.Protocol === 'TLS' && __port.TLS?.TLSModeType === 'Terminate' ? (
+      __port.TLS.ALPN ? (
+        names.indexOf(__port.TLS.ALPN.toLowerCase())
+      ) : (
+        ((names.indexOf('http/1.1') + 1) || (names.indexOf('h2') + 1)) - 1
+      )
+    ) : (
+      ((names.indexOf('h2') + 1) || (names.indexOf('http/1.1') + 1)) - 1
+    )
+  ),
+
 ) => pipy({
   _tls: undefined,
   _domainName: undefined,
@@ -104,10 +116,10 @@
 .branch(
   () => Boolean(_tls), (
     $=>$.branch(
-      () => __port?.TLS?.mTLS, (
+      () => __port?.TLS?.MTLS, (
         $=>$.acceptTLS({
           certificate: (sni, cert) => (
-            __consumer = {sni, cert, mTLS: true, type: 'terminate'},
+            __consumer = { sni, cert, mtls: true, type: 'terminate' },
             {
               cert: _tls.cert,
               key: _tls.key,
@@ -118,16 +130,18 @@
             ok
           ),
           trusted: unionCA,
+          alpn: alpnPolicy,
         }).to($=>$.chain())
       ), (
         $=>$.acceptTLS({
           certificate: (sni, cert) => (
-            __consumer = {sni, cert, type: 'terminate'},
+            __consumer = { sni, cert, type: 'terminate' },
             {
               cert: _tls.cert,
               key: _tls.key,
             }
           ),
+          alpn: alpnPolicy,
         }).to($=>$.chain())
       )
     )

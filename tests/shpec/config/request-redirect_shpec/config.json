@@ -8,16 +8,16 @@
       "Protocol": "HTTP",
       "Port": 80,
       "AccessControlLists": {
-        "blacklist": [
+        "Blacklist": [
           "127.0.0.1",
           "192.168.122.1/32"
         ],
-        "whitelist": [
+        "Whitelist": [
           "192.168.122.18",
           "127.0.0.11/24"
         ]
       },
-      "bpsLimit": 10000000
+      "BpsLimit": 10000000
     }
   ],
   "Certificate": {
@@ -33,7 +33,9 @@
         "Matches": [
           {
             "BackendService": {
-              "www8848": 100
+              "www8848": {
+                "Weight": 100
+              }
             }
           }
         ]
@@ -42,8 +44,83 @@
         "RouteType": "HTTP",
         "Matches": [
           {
+            "Filters": [
+              {
+                "Type": "RequestHeaderModifier",
+                "Set": [
+                  {
+                    "Name": "host",
+                    "Value": "set-bar"
+                  }
+                ],
+                "Add": [
+                  {
+                    "Name": "accept",
+                    "Value": "xxx"
+                  }
+                ],
+                "Remove": [
+                  "user-agent",
+                  "my-header4"
+                ]
+              },
+              {
+                "Type": "ResponseHeaderModifier",
+                "Set": [
+                  {
+                    "Name": "dummy1",
+                    "Value": "set-bar"
+                  }
+                ],
+                "Add": [
+                  {
+                    "Name": "dummy2",
+                    "Value": "add,baz"
+                  }
+                ],
+                "Remove": [
+                  "dummy3",
+                  "my-header8"
+                ]
+              },
+              {
+                "Type": "RequestMirror",
+                "backendRef": "namespace/service-name:port"
+              },
+              {
+                "Type": "RequestRedirect",
+                "RequestRedirect": {
+                  "Scheme": "https",
+                  "Hostname": "",
+                  "Path": {
+                    "Type": "ReplacePrefixMatch",
+                    "ReplacePrefixMatch": "/abc"
+                  },
+                  "Port": 8443,
+                  "StatusCode": 301
+                }
+              },
+              {
+                "Type": "URLRewrite",
+                "Hostname": "",
+                "Path": {
+                  "Type": "ReplacePrefixMatch",
+                  "ReplacePrefixMatch": "/repo"
+                }
+              },
+              {
+                "Type": "URLRewrite",
+                "Hostname": "",
+                "Path": {
+                  "Type": "ReplaceFullPath",
+                  "ReplaceFullPath": "/repo/"
+                }
+              }
+            ],
             "BackendService": {
-              "www8849": 100
+              "www8849": {
+                "Weight": 100
+              }
             }
           }
         ]
@@ -70,74 +147,6 @@
           }
         }
       },
-      "Filters": [
-        {
-          "Type": "RequestHeaderModifier",
-          "set": [
-            {
-              "name": "host",
-              "value": "set-bar"
-            }
-          ],
-          "add": [
-            {
-              "name": "accept",
-              "value": "xxx"
-            }
-          ],
-          "remove": [
-            "user-agent",
-            "my-header4"
-          ]
-        },
-        {
-          "Type": "ResponseHeaderModifier",
-          "set": [
-            {
-              "name": "dummy1",
-              "value": "set-bar"
-            }
-          ],
-          "add": [
-            {
-              "name": "dummy2",
-              "value": "add,baz"
-            }
-          ],
-          "remove": [
-            "dummy3",
-            "my-header8"
-          ]
-        },
-        {
-          "Type": "RequestMirror",
-          "backendRef": "namespace/service-name:port"
-        },
-        {
-          "Type": "RequestRedirect",
-          "scheme": "https",
-          "hostname": "",
-          "path": "/abc",
-          "port": 8443,
-          "statusCode": 301
-        },
-        {
-          "Type": "HTTPURLRewriteFilter",
-          "hostname": "",
-          "Path": {
-            "Type": "ReplacePrefixMatch",
-            "replacePrefixMatch": "/repo"
-          }
-        },
-        {
-          "Type": "HTTPURLRewriteFilter",
-          "hostname": "",
-          "Path": {
-            "Type": "ReplaceFullPath",
-            "replaceFullPath": "/repo/"
-          }
-        }
-      ],
       "ConnectionSettings": {
         "tcp": {
           "MaxConnections": 25
@@ -159,11 +168,11 @@
           }
         }
       },
-      "RetryPolicy": {
+      "Retry": {
         "RetryOn": "5xx",
         "PerTryTimeout": 5,
         "NumRetries": 5,
-        "RetryBackoffBaseInterval": 1
+        "BackoffBaseInterval": 1
       },
       "UpstreamCert0": {
         "CertChain": "-----BEGIN CERTIFICATE-----\nMIIFEjCCAvqgAwIBAgIUKDre1bsG88s52KBVSHKE4bbkDLkwDQYJKoZIhvcNAQEL\nBQAwPDEUMBIGA1UECwwLTXlSb290Q0EgUjIxETAPBgNVBAoMCE15Um9vdENBMREw\nDwYDVQQDDAhNeVJvb3RDQTAeFw0yMjA4MDIwNzA1MzJaFw0zMjA3MzAwNzA1MzJa\nMDUxCzAJBgNVBAYTAkNOMRIwEAYDVQQKDAlNeUludGVyQ0ExEjAQBgNVBAMMCU15\nSW50ZXJDQTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAMCl19pg5Elc\nJ5SJTv4q4NazyoG9hZgOjsciwqnwovVXNQyM5dachwULZ2GeIyovoB6YhhcViM0u\nAGq802LoGK6OxrlLbxRvXohhpQhtzjKeRbfhZBhnHZEJsyFSV0EiY9b3bPUqOLHf\nk+m03gifJfFC4vQzh5EbY0pHc6PWnR5Fb8uDTUJ4mQ71lntQEHCl23ZqlCbhI2c0\ncDavueY/uaY5FUXjz28ZxWAPwVTdInzWbNgO5Rm4QHmJCswfh58wgiDZe6+kuTEd\n4AZPHigXo24I5UApkfbXBL9d1Qh/N7YP8J3I2L/+hdoZmwMZVFg07DmeDfD+LKRN\n1HkCS0nPjRgql4cpwNhaFaotHOlwZ3b+9XFFrj7PJAkFdUpVKrH4yVzyX5Tzjrcy\npAptn47XfGZC5jI0W96cCy+6t5gWEE6pvgqf5RpUhIvqaD1/Rkk16b6GDRbkZMxe\nGBurqzzVRjooddAzPeLxmsbdh7PBsIG3k7Tldwq/VZlfi1zJ5cLsUgBkJesGWYKl\ntFSTc4Ylm0oec0Lp24Hp/KV9f1Xz0uZHgFFzYvNXNvRNvzQoKxA2iDJuw20g5WvM\n7vzfVCQgBvwLEFnSiO+KHoCCKSiMS39yp9WsBgiwW1EtKg5p4EjEe1pHw67P/3wz\n6iztPxN1X6OAhJOHN9JFvEJ+MORdlJ6fAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMB\nAf8wDQYJKoZIhvcNAQELBQADggIBAGtrg5bPTy4u0WZ17j6DV2eWEujMuI22/SNY\nAV5UwGRhHCm7YfeENBByl4kmRSwdzOWwYrNw6wV7sxiMyG0Fd3w4qTnjnMSuxHtu\ngMfi4zU4ZJDMBqM/iupA3JIJJjHY3aKqHS37JCaDfztdzYCtm8tfQ5D6m9M9zGQV\nmvXXLUnFEzNU0ahStPj5fDeflmJZso3Ud5khNxdWrPre3n9zD1N0vEOy6HsF3cxp\nbo4VfFFCmu0njJjfh6gscy4sSFtN/SyjJiYXC5IjKMaw9agG4itbsCCH1Ox76kzA\ntkAsxjZJTl2/gJPsCWXn5ngBpD32TLojvjym7TFRtKmlZNq0WobJTbOIJKjmlCeL\n1LKFwKUD+MY3wU6BV5Wt+nIKZu3sK7rN2vEXmgU3JYZt/2d44yL2ss41QWZ5pPW4\nlwCKTcAQ+wpHw95GcGi8zB+H4MTQdEy7345N9MSBUDKGkLLVnRTBqapF7u222Mob\nrdzkpLLaKVG0+MCYiHyUa7ExgA8ZulhK26Fue/wk6KiNjdip4gJmUbntTrReWeSV\nMbubTjhGwd+zEJrEol471Ia/2e04HAazlG9yvQf1P5XsEyFXY7ufxEkOe9Dc2G9m\nngY9KiyINasT1RCzC1FxzwGttYwZaBvqitRPGlP9P9nALcF0PfYDzydbGPuhfMLP\ncc1choUZ\n-----END CERTIFICATE-----\n",
@@ -234,14 +243,8 @@
     ]
   },
   "Features": {
-    "Logging": {
-
-    },
-    "Tracing": {
-
-    },
-    "Metrics": {
-
-    }
+    "Logging": {},
+    "Tracing": {},
+    "Metrics": {}
   }
 }

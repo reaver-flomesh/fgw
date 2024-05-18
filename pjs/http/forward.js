@@ -1,10 +1,15 @@
 ((
-  { isDebugEnabled } = pipy.solve('config.js'),
+  { config, isDebugEnabled } = pipy.solve('config.js'),
+
+  { healthCheckTargets, healthCheckServices } = pipy.solve('common/variables.js'),
 
   {
     shuffle,
     failover,
   } = pipy.solve('lib/utils.js'),
+
+  http1PerRequestLoadBalancing = Boolean(config?.Configs?.HTTP1PerRequestLoadBalancing),
+  http2PerRequestLoadBalancing = (config?.Configs?.HTTP2PerRequestLoadBalancing === undefined) || Boolean(config?.Configs?.HTTP2PerRequestLoadBalancing),
 
   retryCounter = new stats.Counter('fgw_upstream_rq_retry', ['service_name']),
   retrySuccessCounter = new stats.Counter('fgw_upstream_rq_retry_success', ['service_name']),
@@ -17,12 +22,24 @@
     serviceConfig && (
       (
         endpointAttributes = {},
-        obj = {
-          targetBalancer: serviceConfig.Endpoints && new algo.RoundRobinLoadBalancer(
-            shuffle(Object.fromEntries(Object.entries(serviceConfig.Endpoints)
+        endpoints = shuffle(
+          Object.fromEntries(
+            Object.entries(serviceConfig.Endpoints)
               .map(([k, v]) => (endpointAttributes[k] = v, v.hash = algo.hash(k), [k, v.Weight]))
-              .filter(([k, v]) => v > 0)
-            ))
+              .filter(([k, v]) => (serviceConfig.Algorithm !== 'RoundRobinLoadBalancer' || v > 0))
+          )
+        ),
+        obj = {
+          targetBalancer: serviceConfig.Endpoints && (
+            (serviceConfig.Algorithm === 'HashingLoadBalancer') ? (
+              new algo.HashingLoadBalancer(Object.keys(endpoints))
+            ) : (
+              (serviceConfig.Algorithm === 'LeastConnectionLoadBalancer') ? (
+                new algo.LeastWorkLoadBalancer(Object.keys(endpoints))
+              ) : (
+                new algo[serviceConfig.Algorithm || 'RoundRobinLoadBalancer'](endpoints)
+              )
+            )
           ),
           endpointAttributes,
           ...(serviceConfig.StickyCookieName && ({
@@ -37,9 +54,9 @@
             }
           })),
           failoverBalancer: serviceConfig.Endpoints && failover(Object.fromEntries(Object.entries(serviceConfig.Endpoints).map(([k, v]) => [k, v.Weight]))),
-          needRetry: Boolean(serviceConfig.RetryPolicy?.NumRetries),
-          numRetries: serviceConfig.RetryPolicy?.NumRetries,
-          retryStatusCodes: (serviceConfig.RetryPolicy?.RetryOn || '5xx').split(',').reduce(
+          needRetry: Boolean(serviceConfig.Retry?.NumRetries),
+          numRetries: serviceConfig.Retry?.NumRetries,
+          retryStatusCodes: (serviceConfig.Retry?.RetryOn || '5xx').split(',').reduce(
             (lut, code) => (
               code.endsWith('xx') ? (
                 new Array(100).fill(0).forEach((_, i) => lut[(code.charAt(0) | 0) * 100 + i] = true)
@@ -50,7 +67,7 @@
             ),
             []
           ),
-          retryBackoffBaseInterval: serviceConfig.RetryPolicy?.RetryBackoffBaseInterval > 1 ? 1 : serviceConfig.RetryPolicy?.RetryBackoffBaseInterval,
+          retryBackoffBaseInterval: serviceConfig.Retry?.BackoffBaseInterval > 1 ? 1 : serviceConfig.Retry?.BackoffBaseInterval,
           retryCounter: retryCounter.withLabels(serviceConfig.name),
           retrySuccessCounter: retrySuccessCounter.withLabels(serviceConfig.name),
           retryLimitCounter: retryLimitCounter.withLabels(serviceConfig.name),
@@ -59,7 +76,7 @@
           retryBackoffLimitCounter: retryBackoffLimitCounter.withLabels(serviceConfig.name),
           muxHttpOptions: {
             version: () => (__domain?.RouteType === 'GRPC' || __domain?.RouteType === 'HTTP2') ? 2 : 1,
-            maxMessages: serviceConfig.ConnectionSettings?.http?.MaxRequestsPerConnection
+            maxMessages: serviceConfig.MaxRequestsPerConnection
           },
         },
       ) => (
@@ -124,27 +141,39 @@
     )
   )(),
 
+  proxyPreserveHostCache = new algo.Cache(
+    route => !(route?.config?.ProxyPreserveHost === false || __domain?.ProxyPreserveHost === false || config?.Configs?.ProxyPreserveHost === false)
+  ),
+
 ) => pipy({
   _retryCount: 0,
   _serviceConfig: null,
   _targetBalancer: null,
   _failoverBalancer: null,
   _muxHttpOptions: null,
+  _version: null,
+  _session: null,
   _cookies: null,
   _cookieId: null,
   _isRetry: false,
   _unhealthCache: null,
   _healthCheckTarget: null,
+  _targetResource: null,
+  _balancerKey: undefined,
 })
 
 .import({
   __domain: 'route',
+  __route: 'route',
   __service: 'service',
   __cert: 'connect-tls',
+  __host: 'connect-tls',
+  __useSSL: 'connect-tls',
   __target: 'connect-tcp',
   __metricLabel: 'connect-tcp',
-  __healthCheckTargets: 'health-check',
-  __healthCheckServices: 'health-check',
+  __upstreamError: 'connect-tcp',
+  __responseHead: 'http',
+  __responseTail: 'http',
 })
 
 .pipeline()
@@ -153,19 +182,22 @@
     (_serviceConfig = serviceConfigs.get(__service)) && (
       __metricLabel = __service.name,
       _muxHttpOptions = _serviceConfig.muxHttpOptions,
+      _version = _muxHttpOptions.version(),
+      _session = {},
       _targetBalancer = _serviceConfig.targetBalancer,
       _serviceConfig.failoverBalancer && (
         _failoverBalancer = _serviceConfig.failoverBalancer
       ),
-      _unhealthCache = __healthCheckServices?.[__service.name]
+      _unhealthCache = healthCheckServices?.[__service.name]
     )
   )
 )
+.onEnd(() => void (_session = null))
 .branch(
   () => _serviceConfig?.needRetry || _failoverBalancer, (
     $=>$
     .replay({
-      delay: () => _serviceConfig.retryBackoffBaseInterval * Math.min(10, Math.pow(2, _retryCount-1)|0)
+      delay: () => _serviceConfig.retryBackoffBaseInterval * Math.min(10, Math.pow(2, _retryCount - 1) | 0)
     }).to(
       $=>$
       .link('upstream')
@@ -198,17 +230,44 @@
       _cookieId ? (
         __target = _cookieId
       ) : (
-        __target = _targetBalancer?.borrow?.({}, undefined, _unhealthCache)?.id
+        (__service?.Algorithm === 'HashingLoadBalancer') && (_balancerKey = __inbound.remoteAddress),
+        (_version === 2) ? (
+          http2PerRequestLoadBalancing ? (
+            _targetResource = _targetBalancer?.borrow?.({}, _balancerKey, _unhealthCache)
+          ) : (
+            _targetResource = _targetBalancer?.borrow?.(__inbound, _balancerKey, _unhealthCache)
+          )
+        ) : http1PerRequestLoadBalancing ? (
+          _targetResource = _targetBalancer?.borrow?.(_session, _balancerKey, _unhealthCache)
+        ) : (
+          _targetResource = _targetBalancer?.borrow?.(__inbound, _balancerKey, _unhealthCache)
+        ),
+        _targetResource && (
+          __target = _targetResource?.id
+        )
       ),
       __target
     ) && (
       (
         attrs = _serviceConfig?.endpointAttributes?.[__target]
       ) => (
+        (__host = attrs?.Host) ? (
+          msg.head.headers.host = __host
+        ) : !proxyPreserveHostCache.get(__route) && (
+          msg.head.headers.host = __target
+        ),
         attrs?.UpstreamCert ? (
           __cert = attrs?.UpstreamCert
         ) : (
           __cert = __service?.UpstreamCert
+        ),
+        __cert ? (
+          !__service?.MTLS && (
+            __useSSL = true,
+            __cert = null
+          )
+        ) : (
+          __useSSL = Boolean(attrs?.UseSSL)
         ),
         _cookieId ? (
           _cookieId = null
@@ -227,7 +286,7 @@
   isDebugEnabled, (
     $=>$.handleStreamStart(
       () => (
-        console.log('[forward] target, cert:', __target, Boolean(__cert))
+        console.log('[forward] target, cert, host/sni, useSSL:', __target, Boolean(__cert), __host, __useSSL)
       )
     )
   )
@@ -251,9 +310,9 @@
     )
   ),
   (
-    $=>$.muxHTTP(() => undefined, () => _muxHttpOptions).to(
+    $=>$.muxHTTP(() => _targetResource, () => _muxHttpOptions).to(
       $=>$.branch(
-        () => __cert, (
+        () => __cert || __useSSL, (
           $=>$.use('lib/connect-tls.js')
         ), (
           $=>$.use('lib/connect-tcp.js')
@@ -262,19 +321,29 @@
     )
     .handleMessage(
       msg => (
-        (_healthCheckTarget = __healthCheckTargets?.[__target + '@' + __service.name]) && (
-          (!msg?.head?.status || (msg?.head?.status > 499)) ? (
-            _healthCheckTarget.service.fail(_healthCheckTarget)
-          ) : (
-            _healthCheckTarget.service.ok(_healthCheckTarget)
+        config?.Configs?.ShowUpstreamStatusInResponseHeader && (
+          (msg?.head?.status > 399) && (__upstreamError != 'ConnectionRefused') && (
+            msg.head.headers ? (
+              msg.head.headers['X-FGW-Upstream-Status'] = msg.head.status
+            ) : (
+              msg.head.headers = { 'X-FGW-Upstream-Status': msg.head.status }
+            )
+          )
+        ),
+        (_healthCheckTarget = healthCheckTargets?.[__target + '@' + __service.name]) && (
+          (__upstreamError === 'ConnectionRefused') && (
+            _healthCheckTarget.service.fail(_healthCheckTarget),
+            _healthCheckTarget.reason = 'ConnectionRefused'
           )
         )
       )
     )
     .branch(
       () => _cookieId, (
-        $=>$.handleMessageStart(
+        $=>$
+        .handleMessageStart(
           msg => (
+            __responseHead = msg.head,
             msg?.head?.headers && (
               !msg.head.headers['set-cookie'] && (
                 msg.head.headers['set-cookie'] = []
@@ -286,6 +355,9 @@
               )
             )
           )
+        )
+        .handleMessageEnd(
+          msg => __responseTail = msg.tail
         )
       ), (
         $=>$

@@ -1,6 +1,8 @@
 ((
   { config, isDebugEnabled } = pipy.solve('config.js'),
 
+  { healthCheckTargets, healthCheckServices } = pipy.solve('common/variables.js'),
+
   {
     shuffle,
     failover,
@@ -19,12 +21,24 @@
     serviceConfig && (
       (
         endpointAttributes = {},
+        endpoints = shuffle(
+          Object.fromEntries(
+            Object.entries(serviceConfig.Endpoints)
+              .map(([k, v]) => (endpointAttributes[k] = v, v.hash = algo.hash(k), [k, v.Weight]))
+              .filter(([k, v]) => (serviceConfig.Algorithm !== 'RoundRobinLoadBalancer' || v > 0))
+          )
+        ),
         obj = {
-          targetBalancer: serviceConfig.Endpoints && new algo.RoundRobinLoadBalancer(
-            shuffle(Object.fromEntries(Object.entries(serviceConfig.Endpoints)
-              .map(([k, v]) => (endpointAttributes[k] = v, [k, v.Weight]))
-              .filter(([k, v]) => v > 0)
-            ))
+          targetBalancer: serviceConfig.Endpoints && (
+            (serviceConfig.Algorithm === 'HashingLoadBalancer') ? (
+              new algo.HashingLoadBalancer(Object.keys(endpoints))
+            ) : (
+              (serviceConfig.Algorithm === 'LeastConnectionLoadBalancer') ? (
+                new algo.LeastWorkLoadBalancer(Object.keys(endpoints))
+              ) : (
+                new algo[serviceConfig.Algorithm || 'RoundRobinLoadBalancer'](endpoints)
+              )
+            )
           ),
           endpointAttributes,
           failoverBalancer: serviceConfig.Endpoints && failover(Object.fromEntries(Object.entries(serviceConfig.Endpoints).map(([k, v]) => [k, v.Weight]))),
@@ -63,8 +77,6 @@
   __cert: 'connect-tls',
   __target: 'connect-tcp',
   __metricLabel: 'connect-tcp',
-  __healthCheckTargets: 'health-check',
-  __healthCheckServices: 'health-check',
 })
 
 .pipeline()
@@ -74,8 +86,8 @@
       (__service = serviceHandlers.get(_balancer.borrow({}).id)) && (
         (_serviceConfig = serviceConfigs.get(__service)) && (
           __metricLabel = __service.name,
-          _unhealthCache = __healthCheckServices?.[__service.name],
-          (__target = _serviceConfig.targetBalancer?.borrow?.({}, undefined, _unhealthCache)?.id) && (
+          _unhealthCache = healthCheckServices?.[__service.name],
+          (__target = _serviceConfig.targetBalancer?.borrow?.(__inbound, undefined, _unhealthCache)?.id) && (
             (
               attrs = _serviceConfig?.endpointAttributes?.[__target]
             ) => (
@@ -114,7 +126,7 @@
     )
     .handleStreamEnd(
       e => (
-        (_healthCheckTarget = __healthCheckTargets?.[__target + '@' + __service.name]) && (
+        (_healthCheckTarget = healthCheckTargets?.[__target + '@' + __service.name]) && (
           (!e.error || e.error === "ReadTimeout" || e.error === "WriteTimeout" || e.error === "IdleTimeout") ? (
             _healthCheckTarget.service.ok(_healthCheckTarget)
           ) : (

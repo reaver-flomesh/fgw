@@ -62,6 +62,8 @@
 
 .export('connect-tls', {
   __cert: null,
+  __host: null,
+  __useSSL: false,
 })
 
 .pipeline()
@@ -74,8 +76,16 @@
       }),
       trusted: unionCA,
       alpn: 'h2',
-    }).to($=>$.use('lib/connect-tcp.js'))
-  ), (
+      sni: () => __host || '',
+    }).to($ => $.use('lib/connect-tcp.js'))
+  ),
+  () => __useSSL, (
+    $=>$.connectTLS({
+      trusted: unionCA,
+      sni: () => __host || '',
+    }).to($ => $.use('lib/connect-tcp.js'))
+  ),
+  (
     $=>$.use('lib/connect-tcp.js')
   )
 )

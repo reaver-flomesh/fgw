@@ -1,8 +1,6 @@
 ((
-  { isDebugEnabled } = pipy.solve('config.js'),
-  {
-    metricsCache,
-  } = pipy.solve('lib/metrics.js'),
+  { isDebugEnabled, socketTimeoutOptions } = pipy.solve('config.js'),
+  { metrics, metricsCache } = pipy.solve('lib/metrics.js'),
 ) => (
 
 pipy({
@@ -12,13 +10,15 @@ pipy({
 .export('connect-tcp', {
   __target: null,
   __metricLabel: null,
+  __upstreamError: null,
 })
 
 .pipeline()
 .onStart(
   () => void (
     _metrics = metricsCache.get(__metricLabel),
-    _metrics.activeConnectionGauge.increase()
+    _metrics.activeConnectionGauge.increase(),
+    metrics.fgwStreamConnectionTotal.withLabels(__metricLabel).increase()
   )
 )
 .onEnd(
@@ -41,13 +41,9 @@ pipy({
     _metrics.sendBytesTotalCounter.increase(data.size)
   )
 )
-.branch(
-  () => __target.startsWith('127.0.0.1:'), (
-    $=>$.connect(() => __target, { bind: '127.0.0.1' })
-  ),
-  (
-    $=>$.connect(() => __target)
-  )
+.connect(() => __target, socketTimeoutOptions)
+.handleStreamEnd(
+  e => e.error && (__upstreamError = e.error)
 )
 .handleData(
   data => (
